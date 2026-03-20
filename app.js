@@ -98,6 +98,16 @@
           actionBusyId.value = '';
         }
 
+        function isMissingSessionError(error) {
+          return !!(
+            error && (
+              error.name === 'AuthSessionMissingError' ||
+              error.__isAuthError === true ||
+              String(error.message || '').toLowerCase().includes('auth session missing')
+            )
+          );
+        }
+
         function formatDate(value) {
           if (!value) return 'TBD';
           return new Intl.DateTimeFormat(undefined, {
@@ -260,6 +270,7 @@
               email: email.value.trim(),
               password: password.value
             });
+
             if (error) {
               if ((error.message || '').includes('Email not confirmed')) {
                 authError.value = 'Please check your email and click the confirmation link first.';
@@ -267,34 +278,35 @@
               }
               throw error;
             }
+
             authNotice.value = 'Signed in successfully.';
             await refreshAppState(data.user);
           } catch (error) {
             console.error('Auth error:', error.message, error);
-            authError.value = error.message || 'Authentication failed.';
+            authError.value = error.message || 'Unable to complete authentication right now.';
           } finally {
             authBusy.value = false;
           }
         }
 
-        async function signOut() {
+        async function handleLogout() {
           if (signingOut.value) return;
-          resetAuthFeedback();
           signingOut.value = true;
-          statusMessage.value = 'Signing you out...';
+          authError.value = '';
+          authNotice.value = '';
           try {
             const { error } = await client.auth.signOut();
             if (error) throw error;
             user.value = null;
             resetSessionView();
-            authMode.value = 'signin';
             password.value = '';
-            authNotice.value = 'You have been logged out.';
-            statusMessage.value = '';
-            await refreshAppState(null);
+            authMode.value = 'signin';
+            screen.value = 'signin';
+            authNotice.value = 'Logged out successfully.';
+            await loadReleases();
           } catch (error) {
-            console.error('Sign out error:', error.message, error);
-            statusMessage.value = 'Could not log you out. Please try again.';
+            console.error('Logout error:', error.message, error);
+            authError.value = error.message || 'Unable to log out right now.';
           } finally {
             signingOut.value = false;
           }
@@ -302,9 +314,9 @@
 
         async function toggleFavorite(release) {
           if (!user.value) {
+            authNotice.value = 'Sign in required to save favorites.';
             screen.value = 'signin';
             authMode.value = 'signin';
-            authNotice.value = 'Please sign in to save favorites.';
             return;
           }
 
@@ -315,6 +327,7 @@
               const { error } = await client.from(FAVORITES_TABLE).delete().eq('id', existing.id);
               if (error) throw error;
               favorites.value = favorites.value.filter((item) => item.id !== existing.id);
+              authNotice.value = 'Removed from favorites.';
             } else {
               const { data, error } = await client
                 .from(FAVORITES_TABLE)
@@ -322,11 +335,14 @@
                 .select('id, release_id')
                 .single();
               if (error) throw error;
-              if (data) favorites.value = [data, ...favorites.value];
+              if (data) {
+                favorites.value = [data, ...favorites.value];
+              }
+              authNotice.value = 'Added to favorites.';
             }
           } catch (error) {
-            console.error('Favorite toggle error:', error.message, error);
-            statusMessage.value = 'Could not update favorites right now.';
+            console.error('Favorite action error:', error.message, error);
+            authError.value = error.message || 'Could not update favorites right now.';
           } finally {
             actionBusyId.value = '';
           }
@@ -334,23 +350,24 @@
 
         onMounted(async () => {
           try {
-            const { data, error } = await client.auth.getUser();
-            if (error) throw error;
-            await refreshAppState(data.user || null);
-
-            client.auth.onAuthStateChange(async (_event, session) => {
-              try {
-                await refreshAppState(session?.user || null);
-              } catch (listenerError) {
-                console.error('Auth state change error:', listenerError.message, listenerError);
-              }
-            });
+            const { data, error } = await client.auth.getSession();
+            if (error && !isMissingSessionError(error)) {
+              throw error;
+            }
+            await refreshAppState(data?.session?.user || null);
           } catch (error) {
             console.error('App init error:', error.message, error);
-            screen.value = 'signin';
-            statusMessage.value = 'We could not verify your session, but you can still sign in.';
-            await loadReleases();
+            statusMessage.value = 'Could not restore your session, but you can still browse releases.';
+            await refreshAppState(null);
           }
+
+          client.auth.onAuthStateChange(async (_event, session) => {
+            try {
+              await refreshAppState(session?.user || null);
+            } catch (error) {
+              console.error('Auth state sync error:', error.message, error);
+            }
+          });
         });
 
         return {
@@ -380,15 +397,15 @@
           authSubtitle,
           authButtonLabel,
           userLabel,
+          switchAuthMode,
+          submitAuth,
+          handleLogout,
+          toggleFavorite,
           formatDate,
           formatPrice,
           daysUntil,
           imageFor,
-          isFavorite,
-          submitAuth,
-          signOut,
-          toggleFavorite,
-          switchAuthMode
+          isFavorite
         };
       },
       template: `
@@ -396,47 +413,43 @@
           <div class="bg-glow glow-one"></div>
           <div class="bg-glow glow-two"></div>
 
-          <section v-if="screen === 'loading'" class="screen-center">
-            <div class="auth-card">
+          <main v-if="screen === 'loading'" class="screen-center">
+            <section class="panel">
               <span class="eyebrow">Sole Drop Radar</span>
-              <h2>Loading your release radar...</h2>
-              <p class="muted-copy">Checking your session and syncing the latest sneaker data.</p>
-            </div>
-          </section>
+              <h2>Loading your release feed...</h2>
+              <p class="muted-copy">Checking your session and syncing the latest sneaker drops.</p>
+            </section>
+          </main>
 
-          <section v-else-if="screen === 'check-email'" class="screen-center">
-            <div class="auth-card">
+          <main v-else-if="screen === 'check-email'" class="screen-center">
+            <section class="auth-card">
               <span class="eyebrow">Check your email</span>
               <h2>Confirm your account</h2>
-              <p class="muted-copy">
-                {{ authNotice || 'We sent a confirmation link to your email. Open it, then come back and sign in.' }}
-              </p>
-              <button class="primary-btn" type="button" @click="switchAuthMode('signin'); screen = 'signin'">
-                Go to sign in
-              </button>
-            </div>
-          </section>
+              <p class="muted-copy">We sent a confirmation link to {{ email }}. Open it, then come back here and sign in.</p>
+              <button class="secondary-btn" @click="switchAuthMode('signin'); screen = 'signin'">Go to sign in</button>
+            </section>
+          </main>
 
-          <section v-else-if="screen === 'signin'" class="screen-center">
-            <div class="auth-card">
+          <main v-else-if="screen === 'signin'" class="screen-center">
+            <section class="auth-card">
               <span class="eyebrow">Sole Drop Radar</span>
               <h2>{{ authTitle }}</h2>
               <p class="muted-copy">{{ authSubtitle }}</p>
+
               <form class="auth-form" @submit.prevent="submitAuth">
                 <label>
                   Email
-                  <input v-model.trim="email" type="email" autocomplete="email" placeholder="you@example.com" />
+                  <input v-model.trim="email" type="email" placeholder="you@example.com" autocomplete="email" />
                 </label>
                 <label>
                   Password
-                  <input v-model="password" type="password" autocomplete="current-password" placeholder="Enter your password" />
+                  <input v-model="password" type="password" placeholder="Enter your password" autocomplete="current-password" />
                 </label>
                 <div v-if="authError" class="form-error">{{ authError }}</div>
                 <div v-else-if="authNotice" class="status-banner">{{ authNotice }}</div>
-                <button class="primary-btn" type="submit" :disabled="authBusy">
-                  {{ authButtonLabel }}
-                </button>
+                <button class="primary-btn" type="submit" :disabled="authBusy">{{ authButtonLabel }}</button>
               </form>
+
               <button
                 v-if="authMode === 'signup'"
                 class="text-btn"
@@ -451,91 +464,90 @@
                 type="button"
                 @click="switchAuthMode('signup')"
               >
-                Do not have an account? Sign up
+                Don't have an account? Sign up
               </button>
-            </div>
-          </section>
+            </section>
+          </main>
 
           <main v-else class="container">
-            <header class="hero-card">
-              <div class="hero-copy">
+            <section class="hero-card">
+              <div>
                 <span class="eyebrow">Sneaker release tracker</span>
                 <h1>Stay ahead of every drop.</h1>
-                <p class="muted-copy">
-                  Browse release dates, save favorites, and keep your personal sneaker radar synced across sessions.
+                <p class="hero-copy muted-copy">
+                  Browse upcoming releases, keep tabs on countdowns, and save your favorites to your personal radar.
                 </p>
+                <div v-if="nextDrop" class="pill">
+                  Next up: {{ nextDrop.brand }} {{ nextDrop.name }} - {{ daysUntil(nextDrop.release_date) }}
+                </div>
               </div>
 
               <div class="hero-actions">
-                <div class="pill">{{ userLabel }}</div>
+                <div class="pill">Signed in as {{ userLabel }}</div>
                 <div class="toggle-row">
                   <button class="tab-btn" :class="{ active: filter === 'all' }" @click="filter = 'all'">All drops</button>
                   <button class="tab-btn" :class="{ active: filter === 'upcoming' }" @click="filter = 'upcoming'">Upcoming</button>
                   <button class="tab-btn" :class="{ active: filter === 'favorites' }" @click="filter = 'favorites'">Favorites</button>
                 </div>
-                <button class="secondary-btn logout-btn" type="button" :disabled="signingOut" @click="signOut">
+                <button class="secondary-btn logout-btn" @click="handleLogout" :disabled="signingOut">
                   {{ signingOut ? 'Logging out...' : 'Log out' }}
                 </button>
               </div>
-            </header>
+            </section>
 
-            <div v-if="statusMessage" class="status-banner">{{ statusMessage }}</div>
+            <section v-if="authNotice || statusMessage" class="status-banner">
+              {{ authNotice || statusMessage }}
+            </section>
 
             <section class="stats-grid">
               <article class="stat-card">
-                <span>Loaded releases</span>
-                <strong>{{ loadingReleases ? '...' : loadedCount }}</strong>
+                <span>Total releases</span>
+                <strong>{{ loadedCount }}</strong>
               </article>
               <article class="stat-card">
-                <span>Upcoming pairs</span>
-                <strong>{{ loadingReleases ? '...' : upcomingCount }}</strong>
+                <span>Upcoming drops</span>
+                <strong>{{ upcomingCount }}</strong>
               </article>
               <article class="stat-card">
-                <span>Your favorites</span>
-                <strong>{{ loadingFavorites ? '...' : favoriteCount }}</strong>
+                <span>Favorites</span>
+                <strong>{{ favoriteCount }}</strong>
               </article>
-            </section>
-
-            <section v-if="nextDrop" class="panel" style="margin-top: 1rem;">
-              <span class="eyebrow">Next drop</span>
-              <div class="release-top">
-                <div>
-                  <h2 style="margin-bottom: 0.35rem;">{{ nextDrop.name }}</h2>
-                  <p class="muted-copy" style="margin-bottom: 0;">{{ nextDrop.brand }} - {{ formatDate(nextDrop.release_date) }}</p>
-                </div>
-                <div class="countdown-pill">{{ daysUntil(nextDrop.release_date) }}</div>
-              </div>
             </section>
 
             <section class="release-grid">
-              <article v-if="!filteredReleases.length" class="empty-state">
-                <span class="eyebrow">No results</span>
-                <h2 style="margin-bottom: 0.35rem;">Nothing matches this view yet.</h2>
-                <p class="muted-copy" style="margin-bottom: 0;">
-                  Try switching filters or check back when more releases are added.
-                </p>
+              <article v-if="loadingReleases" class="empty-state">
+                <span class="eyebrow">Loading</span>
+                <h2>Fetching the latest drops...</h2>
+                <p class="muted-copy">Your release feed is syncing with the backend.</p>
               </article>
 
-              <article v-for="release in filteredReleases" :key="release.id" class="release-card">
-                <img class="release-image" :src="imageFor(release)" :alt="release.name" loading="lazy" />
+              <article v-else-if="filteredReleases.length === 0" class="empty-state">
+                <span class="eyebrow">Nothing here yet</span>
+                <h2>No releases match this filter.</h2>
+                <p class="muted-copy">Try switching filters or add a favorite once more releases are available.</p>
+              </article>
+
+              <article v-else v-for="release in filteredReleases" :key="release.id" class="release-card">
+                <img class="release-image" :src="imageFor(release)" :alt="release.name" />
                 <div class="release-content">
-                  <span class="release-brand">{{ release.brand }}</span>
                   <div class="release-top">
                     <div>
-                      <h2 style="margin-bottom: 0.35rem;">{{ release.name }}</h2>
-                      <p class="muted-copy" style="margin-bottom: 0;">{{ formatDate(release.release_date) }}</p>
+                      <span class="release-brand">{{ release.brand || 'Sneaker drop' }}</span>
+                      <h2>{{ release.name || 'Untitled release' }}</h2>
                     </div>
                     <div class="countdown-pill">{{ daysUntil(release.release_date) }}</div>
                   </div>
 
+                  <p class="muted-copy">{{ release.description || 'No description available yet.' }}</p>
+
                   <div class="detail-grid">
                     <div>
-                      <span class="detail-label">Retail</span>
-                      <strong>{{ formatPrice(release.retail_price) }}</strong>
+                      <span class="detail-label">Release date</span>
+                      <strong>{{ formatDate(release.release_date) }}</strong>
                     </div>
                     <div>
-                      <span class="detail-label">SKU</span>
-                      <strong>{{ release.sku || 'TBD' }}</strong>
+                      <span class="detail-label">Retail price</span>
+                      <strong>{{ formatPrice(release.price) }}</strong>
                     </div>
                   </div>
 
@@ -543,10 +555,10 @@
                     <button
                       class="favorite-btn"
                       :class="{ active: isFavorite(release.id) }"
-                      :disabled="actionBusyId === release.id"
                       @click="toggleFavorite(release)"
+                      :disabled="actionBusyId === release.id || loadingFavorites"
                     >
-                      {{ actionBusyId === release.id ? 'Saving...' : (isFavorite(release.id) ? 'Saved to favorites' : 'Save to favorites') }}
+                      {{ isFavorite(release.id) ? 'Favorited' : 'Add to favorites' }}
                     </button>
                     <div class="status-chip">{{ release.status || 'scheduled' }}</div>
                   </div>
@@ -558,15 +570,6 @@
       `
     }).mount('#app');
   } catch (error) {
-    console.error('App bootstrap error:', error.message, error);
-    document.body.innerHTML = `
-      <main style="min-height:100vh;display:grid;place-items:center;background:#090b12;color:#f8fafc;font-family:Inter,system-ui,sans-serif;padding:1rem;">
-        <section style="max-width:560px;background:rgba(12,18,36,0.88);border:1px solid rgba(255,255,255,0.08);border-radius:24px;padding:1.5rem;box-shadow:0 20px 60px rgba(0,0,0,0.28);">
-          <p style="margin:0 0 0.5rem;color:#8bdcfb;text-transform:uppercase;letter-spacing:0.12em;font-size:0.8rem;">Sole Drop Radar</p>
-          <h1 style="margin:0 0 0.75rem;font-size:1.8rem;">Something went wrong while loading the app.</h1>
-          <p style="margin:0;color:rgba(232,238,255,0.78);">Please refresh the page. If the issue continues, open the console and share the error.</p>
-        </section>
-      </main>
-    `;
+    console.error('App boot error:', error.message, error);
   }
 })();
