@@ -34,6 +34,7 @@
         const booting = ref(true);
         const authInitialized = ref(false);
         const authTransitionToken = ref(0);
+        const authEventInFlight = ref(false);
 
         const filteredReleases = computed(() => {
           const now = new Date();
@@ -99,6 +100,8 @@
           authMode.value = mode;
           screen.value = mode === 'signup' ? 'signup' : 'signin';
           resetAuthFeedback();
+          authBusy.value = false;
+          signingOut.value = false;
           if (mode === 'signin' && email.value.trim()) {
             authNotice.value = 'Sign in with your existing account.';
           }
@@ -128,6 +131,8 @@
 
           user.value = null;
           signingOut.value = false;
+          authBusy.value = false;
+          authEventInFlight.value = false;
           resetSessionView();
           clearAuthForm({ keepEmail });
           authMode.value = mode;
@@ -260,144 +265,177 @@
           }
         }
 
-        async function refreshAppState(currentUser, options = {}) {
-          const { notice = '' } = options;
-          const token = nextTransitionToken();
-          user.value = currentUser || null;
+        async function restoreSignedInState(currentUser, token) {
+          user.value = currentUser;
+          screen.value = 'app';
+          authError.value = '';
+          authNotice.value = 'Signed in successfully.';
+          clearAuthForm({ keepEmail: true });
+          await ensureAppUser(currentUser);
+          if (!isLatestTransition(token)) return;
+          await loadFavorites();
+        }
 
-          if (currentUser) {
-            screen.value = 'loading';
-            try {
-              await ensureAppUser(currentUser);
-              await Promise.all([loadReleases(), loadFavorites()]);
-              if (!isLatestTransition(token)) return;
-              screen.value = 'app';
-              authMode.value = 'signin';
-              authError.value = '';
-              if (notice) authNotice.value = notice;
-            } catch (error) {
-              console.error('Refresh signed-in state error:', error.message, error);
-              if (!isLatestTransition(token)) return;
+        async function syncSessionFromClient(reason = 'manual') {
+          const token = nextTransitionToken();
+          authEventInFlight.value = true;
+          try {
+            const { data, error } = await client.auth.getUser();
+            if (error) {
+              if (isMissingSessionError(error)) {
+                if (isLatestTransition(token)) {
+                  applySignedOutState({
+                    notice: reason === 'logout' ? 'Logged out successfully.' : 'Sign in to save favorites.',
+                    keepEmail: true,
+                    mode: 'signin'
+                  });
+                }
+                return;
+              }
+              throw error;
+            }
+
+            const currentUser = data?.user || null;
+            if (!isLatestTransition(token)) return;
+
+            if (currentUser) {
+              await restoreSignedInState(currentUser, token);
+            } else {
               applySignedOutState({
-                notice: '',
+                notice: reason === 'logout' ? 'Logged out successfully.' : 'Sign in to save favorites.',
                 keepEmail: true,
                 mode: 'signin'
               });
-              authError.value = 'We could not finish signing you in. Please try again.';
             }
-          } else {
-            resetSessionView();
-            screen.value = 'loading';
-            await loadReleases();
-            if (!isLatestTransition(token)) return;
-            applySignedOutState({
-              notice: notice || authNotice.value || 'Sign in to save favorites.',
-              keepEmail: true,
-              mode: 'signin'
-            });
+          } catch (error) {
+            console.error('Session sync error:', error.message, error);
+            if (isLatestTransition(token)) {
+              applySignedOutState({
+                notice: 'Sign in to save favorites.',
+                keepEmail: true,
+                mode: 'signin'
+              });
+              authError.value = 'We could not verify your session. Please try again.';
+            }
+          } finally {
+            if (isLatestTransition(token)) {
+              authEventInFlight.value = false;
+              authBusy.value = false;
+              signingOut.value = false;
+              booting.value = false;
+              authInitialized.value = true;
+            }
           }
         }
 
-        async function submitAuth() {
-          resetAuthFeedback();
+        async function handleAuthSubmit() {
           if (authBusy.value || signingOut.value) return;
-          if (!email.value.trim() || !password.value.trim()) {
-            authError.value = 'Please enter both email and password.';
+
+          resetAuthFeedback();
+          const trimmedEmail = email.value.trim();
+          const rawPassword = password.value;
+
+          if (!trimmedEmail || !rawPassword) {
+            authError.value = 'Enter both your email and password.';
             return;
           }
 
           authBusy.value = true;
+          email.value = trimmedEmail;
+
           try {
             if (authMode.value === 'signup') {
-              const signupEmail = email.value.trim();
-              const signupPassword = password.value;
               const { error } = await client.auth.signUp({
-                email: signupEmail,
-                password: signupPassword,
-                options: { emailRedirectTo: EMAIL_REDIRECT }
+                email: trimmedEmail,
+                password: rawPassword,
+                options: {
+                  emailRedirectTo: EMAIL_REDIRECT
+                }
               });
 
               if (error) {
                 const message = String(error.message || '').toLowerCase();
                 if (message.includes('already been registered') || message.includes('user already registered')) {
                   const { data: signInData, error: signInError } = await client.auth.signInWithPassword({
-                    email: signupEmail,
-                    password: signupPassword
+                    email: trimmedEmail,
+                    password: rawPassword
                   });
                   if (signInError) {
-                    authError.value = 'Incorrect password for that existing account.';
+                    authError.value = 'Incorrect password. Try signing in with the right password.';
                     return;
                   }
-                  if (signInData?.user) {
-                    await refreshAppState(signInData.user, { notice: 'Signed in successfully.' });
-                    clearAuthForm({ keepEmail: true });
+                  const currentUser = signInData?.user || null;
+                  if (!currentUser) {
+                    authError.value = 'We could not sign you in. Please try again.';
+                    return;
                   }
+                  const token = nextTransitionToken();
+                  await restoreSignedInState(currentUser, token);
                   return;
                 }
                 throw error;
               }
 
-              clearAuthForm({ keepEmail: true });
               screen.value = 'check-email';
-              authNotice.value = `Check your email for a confirmation link sent to ${signupEmail}.`;
+              authNotice.value = 'Account created. Check your email to confirm, then sign in.';
+              password.value = '';
               return;
             }
 
             const { data, error } = await client.auth.signInWithPassword({
-              email: email.value.trim(),
-              password: password.value
+              email: trimmedEmail,
+              password: rawPassword
             });
 
             if (error) {
-              const message = String(error.message || 'Unable to sign in.');
-              if (message.toLowerCase().includes('email not confirmed')) {
+              const message = String(error.message || '').toLowerCase();
+              if (message.includes('email not confirmed')) {
                 authError.value = 'Please check your email and click the confirmation link first.';
-              } else {
-                authError.value = message;
+                return;
               }
+              throw error;
+            }
+
+            const currentUser = data?.user || null;
+            if (!currentUser) {
+              authError.value = 'We could not sign you in. Please try again.';
               return;
             }
 
-            if (data?.user) {
-              await refreshAppState(data.user, { notice: 'Signed in successfully.' });
-              clearAuthForm({ keepEmail: true });
-            }
+            const token = nextTransitionToken();
+            await restoreSignedInState(currentUser, token);
           } catch (error) {
-            console.error('Auth error:', error.message, error);
-            authError.value = error.message || 'Something went wrong. Please try again.';
+            console.error('Auth submit error:', error.message, error);
+            authError.value = error?.message || 'Authentication failed. Please try again.';
           } finally {
             authBusy.value = false;
           }
         }
 
-        async function logout() {
+        async function handleLogout() {
           if (signingOut.value || authBusy.value) return;
-
           signingOut.value = true;
           authError.value = '';
           authNotice.value = 'Logging out...';
 
-          const preservedEmail = user.value?.email || email.value;
-          email.value = preservedEmail || '';
           applySignedOutState({
             notice: 'Logged out successfully.',
             keepEmail: true,
             mode: 'signin'
           });
-          email.value = preservedEmail || '';
 
           try {
             const { error } = await client.auth.signOut();
             if (error && !isMissingSessionError(error)) {
               throw error;
             }
-            await loadReleases();
-            authNotice.value = 'Logged out successfully.';
           } catch (error) {
             console.error('Logout error:', error.message, error);
-            authNotice.value = 'Logged out locally. If another session remains, refresh and try again.';
+            authNotice.value = 'Signed out locally. You can log back in now.';
           } finally {
             signingOut.value = false;
+            authBusy.value = false;
+            authEventInFlight.value = false;
           }
         }
 
@@ -405,68 +443,86 @@
           if (!user.value) {
             authMode.value = 'signin';
             screen.value = 'signin';
-            authNotice.value = 'Sign in required to save favorites.';
+            authNotice.value = 'Sign in required for favorites.';
             return;
           }
           if (actionBusyId.value) return;
-
           actionBusyId.value = releaseId;
           try {
             const existing = favorites.value.find((item) => item.release_id === releaseId);
             if (existing) {
               const { error } = await client.from(FAVORITES_TABLE).delete().eq('id', existing.id);
               if (error) throw error;
+              favorites.value = favorites.value.filter((item) => item.id !== existing.id);
+              authNotice.value = 'Removed from favorites.';
             } else {
-              const { error } = await client.from(FAVORITES_TABLE).insert({ release_id: releaseId });
+              const { data, error } = await client
+                .from(FAVORITES_TABLE)
+                .insert({ release_id: releaseId })
+                .select('id, release_id')
+                .single();
               if (error) throw error;
+              if (data) favorites.value = [data, ...favorites.value];
+              authNotice.value = 'Saved to favorites.';
             }
-            await loadFavorites();
           } catch (error) {
             console.error('Favorite toggle error:', error.message, error);
-            authNotice.value = 'We could not update favorites right now.';
+            authError.value = 'Could not update favorites right now.';
           } finally {
             actionBusyId.value = '';
           }
         }
 
+        function setFilter(nextFilter) {
+          filter.value = nextFilter;
+        }
+
         onMounted(async () => {
           try {
-            const { data, error } = await client.auth.getSession();
-            if (error && !isMissingSessionError(error)) {
-              throw error;
-            }
-            authInitialized.value = true;
-            await refreshAppState(data?.session?.user || null, {
-              notice: data?.session?.user ? 'Signed in successfully.' : 'Sign in to save favorites.'
+            await loadReleases();
+            await syncSessionFromClient('boot');
+
+            client.auth.onAuthStateChange(async (event, session) => {
+              try {
+                if (event === 'SIGNED_OUT') {
+                  applySignedOutState({
+                    notice: 'Logged out successfully.',
+                    keepEmail: true,
+                    mode: 'signin'
+                  });
+                  return;
+                }
+
+                if (event === 'SIGNED_IN' || event === 'INITIAL_SESSION' || event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED') {
+                  const currentUser = session?.user || null;
+                  if (currentUser) {
+                    const token = nextTransitionToken();
+                    await restoreSignedInState(currentUser, token);
+                  } else if (!authBusy.value && !signingOut.value) {
+                    applySignedOutState({
+                      notice: 'Sign in to save favorites.',
+                      keepEmail: true,
+                      mode: 'signin'
+                    });
+                  }
+                }
+              } catch (error) {
+                console.error('Auth state change error:', error.message, error);
+              } finally {
+                authBusy.value = false;
+                signingOut.value = false;
+                authInitialized.value = true;
+                booting.value = false;
+              }
             });
           } catch (error) {
             console.error('App init error:', error.message, error);
-            authInitialized.value = true;
-            await refreshAppState(null, { notice: 'Sign in to save favorites.' });
-          } finally {
             booting.value = false;
+            authInitialized.value = true;
+            screen.value = 'signin';
+            authMode.value = 'signin';
+            authError.value = 'The app could not finish loading. Please refresh and try again.';
           }
-
-          client.auth.onAuthStateChange(async (event, session) => {
-            try {
-              if (!authInitialized.value) return;
-              if (event === 'SIGNED_OUT') {
-                await refreshAppState(null, { notice: 'Logged out successfully.' });
-                return;
-              }
-              if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'INITIAL_SESSION') {
-                if (session?.user) {
-                  await refreshAppState(session.user, {
-                    notice: event === 'TOKEN_REFRESHED' ? 'Session refreshed.' : 'Signed in successfully.'
-                  });
-                }
-              }
-            } catch (error) {
-              console.error('Auth state change error:', error.message, error);
-            } finally {
-              booting.value = false;
-            }
-          });
         });
 
         return {
@@ -498,15 +554,16 @@
           authButtonLabel,
           userLabel,
           logoutLabel,
-          switchAuthMode,
-          submitAuth,
-          logout,
-          toggleFavorite,
           formatDate,
           formatPrice,
           daysUntil,
           imageFor,
-          isFavorite
+          isFavorite,
+          switchAuthMode,
+          handleAuthSubmit,
+          handleLogout,
+          toggleFavorite,
+          setFilter
         };
       },
       template: `
@@ -514,139 +571,36 @@
           <div class="bg-glow glow-one"></div>
           <div class="bg-glow glow-two"></div>
 
-          <main v-if="screen === 'app' && appReady" class="container">
-            <section class="hero-card">
-              <div>
-                <span class="eyebrow">Sneaker release tracker</span>
-                <h1>Sole Drop Radar</h1>
-                <p class="hero-copy muted-copy">
-                  Track upcoming sneaker releases, save your favorites, and keep your release radar up to date.
-                </p>
-              </div>
-
-              <div class="hero-actions">
-                <span class="pill">{{ userLabel }}</span>
-                <div class="toggle-row">
-                  <button class="tab-btn" :class="{ active: filter === 'all' }" @click="filter = 'all'">All</button>
-                  <button class="tab-btn" :class="{ active: filter === 'upcoming' }" @click="filter = 'upcoming'">Upcoming</button>
-                  <button class="tab-btn" :class="{ active: filter === 'favorites' }" @click="filter = 'favorites'">Favorites</button>
-                </div>
-                <button class="secondary-btn logout-btn" @click="logout" :disabled="signingOut || authBusy">
-                  {{ logoutLabel }}
-                </button>
-              </div>
-            </section>
-
-            <section v-if="authNotice || statusMessage" class="status-banner">
-              {{ authNotice || statusMessage }}
-            </section>
-
-            <section class="stats-grid">
-              <article class="stat-card">
-                <span>Loaded releases</span>
-                <strong>{{ loadedCount }}</strong>
-              </article>
-              <article class="stat-card">
-                <span>Upcoming drops</span>
-                <strong>{{ upcomingCount }}</strong>
-              </article>
-              <article class="stat-card">
-                <span>Saved favorites</span>
-                <strong>{{ favoriteCount }}</strong>
-              </article>
-            </section>
-
-            <section class="release-grid">
-              <article v-if="nextDrop" class="release-card">
-                <img class="release-image" :src="imageFor(nextDrop)" :alt="nextDrop.name" />
-                <div class="release-content">
-                  <span class="release-brand">Next drop</span>
-                  <div class="release-top">
-                    <div>
-                      <h2>{{ nextDrop.name }}</h2>
-                      <p class="muted-copy">{{ nextDrop.brand || 'Brand TBA' }}</p>
-                    </div>
-                    <span class="countdown-pill">{{ daysUntil(nextDrop.release_date) }}</span>
-                  </div>
-                  <div class="detail-grid">
-                    <div>
-                      <span class="detail-label">Release date</span>
-                      <strong>{{ formatDate(nextDrop.release_date) }}</strong>
-                    </div>
-                    <div>
-                      <span class="detail-label">Retail</span>
-                      <strong>{{ formatPrice(nextDrop.price) }}</strong>
-                    </div>
-                  </div>
-                </div>
-              </article>
-
-              <article v-for="item in filteredReleases" :key="item.id" class="release-card">
-                <img class="release-image" :src="imageFor(item)" :alt="item.name" />
-                <div class="release-content">
-                  <span class="release-brand">{{ item.brand || 'Brand TBA' }}</span>
-                  <div class="release-top">
-                    <div>
-                      <h2>{{ item.name }}</h2>
-                      <p class="muted-copy">{{ item.colorway || 'Colorway TBA' }}</p>
-                    </div>
-                    <span class="countdown-pill">{{ daysUntil(item.release_date) }}</span>
-                  </div>
-                  <div class="detail-grid">
-                    <div>
-                      <span class="detail-label">Release date</span>
-                      <strong>{{ formatDate(item.release_date) }}</strong>
-                    </div>
-                    <div>
-                      <span class="detail-label">Retail</span>
-                      <strong>{{ formatPrice(item.price) }}</strong>
-                    </div>
-                  </div>
-                  <div class="card-actions">
-                    <button
-                      class="favorite-btn"
-                      :class="{ active: isFavorite(item.id) }"
-                      :disabled="actionBusyId === item.id || loadingFavorites"
-                      @click="toggleFavorite(item.id)"
-                    >
-                      {{ isFavorite(item.id) ? 'Remove favorite' : 'Save favorite' }}
-                    </button>
-                    <span class="status-chip">{{ item.status || 'Scheduled' }}</span>
-                  </div>
-                </div>
-              </article>
-
-              <article v-if="!loadingReleases && filteredReleases.length === 0" class="empty-state">
-                <h2>No releases match this filter</h2>
-                <p class="muted-copy">Try switching tabs or check back soon for new drops.</p>
-              </article>
+          <main v-if="!appReady" class="screen-center">
+            <section class="auth-card">
+              <span class="eyebrow">Sneaker release tracker</span>
+              <h2>Loading your dashboard</h2>
+              <p class="muted-copy">Checking your session and preparing the latest drops.</p>
             </section>
           </main>
 
-          <section v-else class="screen-center">
-            <div class="auth-card">
+          <main v-else-if="!signedIn" class="screen-center">
+            <section class="auth-card">
               <span class="eyebrow">Sneaker release tracker</span>
-              <h2>{{ authTitle }}</h2>
+              <h1>{{ authTitle }}</h1>
               <p class="muted-copy">{{ authSubtitle }}</p>
 
-              <div v-if="screen === 'check-email'" class="auth-form">
-                <button class="primary-btn" @click="switchAuthMode('signin')">Go to sign in</button>
-                <button class="text-btn" @click="switchAuthMode('signup')">Use a different email</button>
-              </div>
+              <div v-if="authNotice" class="status-banner">{{ authNotice }}</div>
+              <div v-if="authError" class="form-error">{{ authError }}</div>
 
-              <form v-else class="auth-form" @submit.prevent="submitAuth">
+              <template v-if="screen === 'check-email'">
+                <button class="primary-btn" type="button" @click="switchAuthMode('signin')">Go to sign in</button>
+              </template>
+
+              <form v-else class="auth-form" @submit.prevent="handleAuthSubmit">
                 <label>
-                  Email
-                  <input v-model.trim="email" type="email" autocomplete="email" placeholder="you@example.com" />
+                  <span>Email</span>
+                  <input v-model="email" type="email" autocomplete="email" inputmode="email" required />
                 </label>
                 <label>
-                  Password
-                  <input v-model="password" type="password" autocomplete="current-password" placeholder="Enter your password" />
+                  <span>Password</span>
+                  <input v-model="password" type="password" autocomplete="current-password" required />
                 </label>
-
-                <p v-if="authError" class="form-error">{{ authError }}</p>
-                <p v-else-if="authNotice" class="muted-copy">{{ authNotice }}</p>
-
                 <button class="primary-btn" type="submit" :disabled="authBusy || signingOut">
                   {{ authButtonLabel }}
                 </button>
@@ -655,6 +609,7 @@
               <button
                 v-if="screen !== 'check-email' && authMode === 'signup'"
                 class="text-btn"
+                type="button"
                 @click="switchAuthMode('signin')"
               >
                 Already have an account? Sign in
@@ -662,25 +617,137 @@
               <button
                 v-if="screen !== 'check-email' && authMode === 'signin'"
                 class="text-btn"
+                type="button"
                 @click="switchAuthMode('signup')"
               >
                 Don't have an account? Sign up
               </button>
-            </div>
-          </section>
+            </section>
+          </main>
+
+          <main v-else class="container">
+            <section class="hero-card">
+              <div>
+                <span class="eyebrow">Sneaker release tracker</span>
+                <h1>Stay ahead of every drop</h1>
+                <p class="hero-copy muted-copy">
+                  Track launch dates, compare prices, and save the releases you care about most.
+                </p>
+              </div>
+              <div class="hero-actions">
+                <span class="pill">{{ userLabel }}</span>
+                <div class="toggle-row">
+                  <button class="tab-btn" :class="{ active: filter === 'all' }" @click="setFilter('all')">All</button>
+                  <button class="tab-btn" :class="{ active: filter === 'upcoming' }" @click="setFilter('upcoming')">Upcoming</button>
+                  <button class="tab-btn" :class="{ active: filter === 'favorites' }" @click="setFilter('favorites')">Favorites</button>
+                </div>
+                <button class="secondary-btn logout-btn" type="button" :disabled="signingOut || authBusy" @click="handleLogout">
+                  {{ logoutLabel }}
+                </button>
+              </div>
+            </section>
+
+            <div v-if="authNotice" class="status-banner">{{ authNotice }}</div>
+            <div v-if="authError" class="form-error" style="margin-top: 1rem;">{{ authError }}</div>
+            <div v-if="statusMessage" class="status-banner">{{ statusMessage }}</div>
+
+            <section class="stats-grid">
+              <article class="stat-card">
+                <span>Total releases</span>
+                <strong>{{ loadedCount }}</strong>
+              </article>
+              <article class="stat-card">
+                <span>Upcoming drops</span>
+                <strong>{{ upcomingCount }}</strong>
+              </article>
+              <article class="stat-card">
+                <span>Favorites</span>
+                <strong>{{ favoriteCount }}</strong>
+              </article>
+            </section>
+
+            <section v-if="nextDrop" class="panel" style="margin-top: 1rem;">
+              <span class="eyebrow">Next drop</span>
+              <h2>{{ nextDrop.brand }} {{ nextDrop.name }}</h2>
+              <p class="muted-copy">
+                Releases {{ formatDate(nextDrop.release_date) }} · {{ formatPrice(nextDrop.price) }} · {{ daysUntil(nextDrop.release_date) }}
+              </p>
+            </section>
+
+            <section class="release-grid">
+              <article v-if="loadingReleases" class="empty-state">
+                <span class="eyebrow">Loading</span>
+                <h2>Getting the latest releases</h2>
+                <p class="muted-copy">Please wait while we load the latest sneaker data.</p>
+              </article>
+
+              <article v-else-if="filteredReleases.length === 0" class="empty-state">
+                <span class="eyebrow">No results</span>
+                <h2>No releases match this view</h2>
+                <p class="muted-copy">Try switching filters or saving a few favorites first.</p>
+              </article>
+
+              <article v-for="item in filteredReleases" :key="item.id" class="release-card">
+                <img class="release-image" :src="imageFor(item)" :alt="item.name" loading="lazy" />
+                <div class="release-content">
+                  <div class="release-top">
+                    <div>
+                      <span class="release-brand">{{ item.brand || 'Brand' }}</span>
+                      <h2>{{ item.name }}</h2>
+                    </div>
+                    <span class="countdown-pill">{{ daysUntil(item.release_date) }}</span>
+                  </div>
+
+                  <div class="detail-grid">
+                    <div>
+                      <span class="detail-label">Release date</span>
+                      <strong>{{ formatDate(item.release_date) }}</strong>
+                    </div>
+                    <div>
+                      <span class="detail-label">Retail price</span>
+                      <strong>{{ formatPrice(item.price) }}</strong>
+                    </div>
+                    <div>
+                      <span class="detail-label">Colorway</span>
+                      <strong>{{ item.colorway || 'TBD' }}</strong>
+                    </div>
+                    <div>
+                      <span class="detail-label">Status</span>
+                      <span class="status-chip">{{ item.status || 'upcoming' }}</span>
+                    </div>
+                  </div>
+
+                  <div class="card-actions">
+                    <button
+                      class="favorite-btn"
+                      :class="{ active: isFavorite(item.id) }"
+                      :disabled="actionBusyId === item.id"
+                      @click="toggleFavorite(item.id)"
+                    >
+                      {{ actionBusyId === item.id ? 'Saving...' : (isFavorite(item.id) ? 'Favorited' : 'Save favorite') }}
+                    </button>
+                    <span class="muted-copy">{{ item.sku || 'SKU TBD' }}</span>
+                  </div>
+                </div>
+              </article>
+            </section>
+          </main>
         </div>
       `
     }).mount('#app');
   } catch (error) {
-    console.error('App bootstrap error:', error.message, error);
-    document.body.innerHTML = `
-      <main style="min-height:100vh;display:grid;place-items:center;background:#090c16;color:#f8fafc;font-family:Inter,system-ui,sans-serif;padding:24px;">
-        <section style="max-width:560px;background:rgba(12,18,36,0.88);border:1px solid rgba(255,255,255,0.08);border-radius:24px;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,0.28);">
-          <p style="margin:0 0 8px;color:#8bdcfb;text-transform:uppercase;letter-spacing:0.12em;font-size:12px;">Sole Drop Radar</p>
-          <h1 style="margin:0 0 12px;font-size:28px;">The app hit an error while loading.</h1>
-          <p style="margin:0;color:rgba(232,238,255,0.78);line-height:1.6;">Please refresh the page. If the issue keeps happening, the latest script may still be loading.</p>
-        </section>
-      </main>
-    `;
+    console.error('Bootstrap error:', error.message, error);
+    const root = document.getElementById('app');
+    if (root) {
+      root.innerHTML = `
+        <main style="min-height:100vh;display:grid;place-items:center;padding:24px;font-family:Inter,system-ui,sans-serif;background:#090c16;color:#f8fafc;">
+          <section style="max-width:520px;width:100%;padding:24px;border-radius:24px;background:rgba(12,18,36,0.85);border:1px solid rgba(255,255,255,0.08);">
+            <p style="margin:0 0 8px;color:#8bdcfb;text-transform:uppercase;letter-spacing:0.12em;font-size:12px;">Sneaker release tracker</p>
+            <h1 style="margin:0 0 12px;font-size:32px;">Something went wrong</h1>
+            <p style="margin:0;color:rgba(232,238,255,0.72);">The app could not start. Please refresh and try again.</p>
+          </section>
+        </main>
+      `;
+    }
   }
 })();
